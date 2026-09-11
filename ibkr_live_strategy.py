@@ -67,10 +67,10 @@ class IBKRLiveStrategyConfig:
     timeout_seconds: int = 20
     symbol: str = "APLD"
     timezone: str = "America/New_York"
-    duration: str = "3 D"
+    duration: str = "1 D"
     bar_size: str = "5 mins"
     what_to_show: str = "TRADES"
-    use_regular_trading_hours: int = 1
+    use_regular_trading_hours: int = 0
     exchange: str = "SMART"
     currency: str = "USD"
     money_per_trade: float = 10000.0
@@ -97,10 +97,10 @@ def load_config():
         timeout_seconds=int(os.environ.get("IBKR_TIMEOUT_SECONDS", "20")),
         symbol=os.environ.get("IBKR_LIVE_SYMBOL", "APLD"),
         timezone=os.environ.get("IBKR_LIVE_TIMEZONE", "America/New_York"),
-        duration=os.environ.get("IBKR_LIVE_DURATION", "3 D"),
+        duration=os.environ.get("IBKR_LIVE_DURATION", "1 D"),
         bar_size=os.environ.get("IBKR_LIVE_BAR_SIZE", "5 mins"),
         what_to_show=os.environ.get("IBKR_LIVE_WHAT_TO_SHOW", "TRADES"),
-        use_regular_trading_hours=int(os.environ.get("IBKR_LIVE_USE_RTH", "1")),
+        use_regular_trading_hours=int(os.environ.get("IBKR_LIVE_USE_RTH", "0")),
         money_per_trade=float(os.environ.get("IBKR_LIVE_MONEY_PER_TRADE", "10000")),
         max_signal_age_minutes=int(
             os.environ.get("IBKR_LIVE_MAX_SIGNAL_AGE_MINUTES", "7")
@@ -179,6 +179,7 @@ class IBKRHistoricalBars(EWrapper, EClient):
 
     def nextValidId(self, orderId):
         self.ready.set()
+        self.reqMarketDataType(1)
         self.reqHistoricalData(
             1,
             stock_contract(self.config),
@@ -376,6 +377,15 @@ def signal_id(action, timestamp, price):
     return f"{action}|{timestamp}|{price}"
 
 
+def bar_minutes_from_size(bar_size):
+    parts = bar_size.strip().split()
+
+    if len(parts) >= 2 and parts[1].lower().startswith("min"):
+        return int(parts[0])
+
+    return 5
+
+
 def is_fresh_signal(signal_time, config):
     if pd.isna(signal_time):
         return False
@@ -461,13 +471,22 @@ def latest_sell_action(strategy_data, state, live_config):
     if shares <= 0:
         return None
 
+    if row.get("force_exit", False):
+        sell_reason = "force_exit"
+    elif row.get("late_sell_signal", False):
+        sell_reason = "late_sell"
+    elif row.get("final_exit_signal", False):
+        sell_reason = "final_exit"
+    else:
+        sell_reason = "profit_sell"
+
     return {
         "action": "SELL",
         "signal_time": row["sell_time"],
         "price": row["sell_price"],
         "shares": shares,
         "signal_id": action_id,
-        "reason": "fresh_strategy_sell",
+        "reason": sell_reason,
     }
 
 
@@ -729,7 +748,8 @@ def print_latest_context(strategy_data):
 def run_one_check(live_config):
     strategy_config = StrategyConfig(
         symbol=live_config.symbol,
-        bar_minutes=5,
+        timezone=live_config.timezone,
+        bar_minutes=bar_minutes_from_size(live_config.bar_size),
         money_per_trade=live_config.money_per_trade,
     )
     state = load_state(live_config.state_path)

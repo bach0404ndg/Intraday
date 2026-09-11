@@ -4,14 +4,8 @@ import os
 import threading
 import time
 
-try:
-    from ibapi.client import EClient
-    from ibapi.wrapper import EWrapper
-except ImportError:
-    print("Missing package: ibapi")
-    print("Install it with: python3 -m pip install ibapi")
-    raise SystemExit(1)
-
+from ibapi.client import EClient
+from ibapi.wrapper import EWrapper
 
 ENV_FILE = Path(".env")
 
@@ -40,12 +34,13 @@ class IBKRConfig:
 
 def load_config():
     load_env_file()
+    config = IBKRConfig()
 
     return IBKRConfig(
-        host=os.environ.get("IBKR_HOST", "127.0.0.1"),
-        port=int(os.environ.get("IBKR_PORT", "4002")),
-        client_id=int(os.environ.get("IBKR_CLIENT_ID", "1")),
-        timeout_seconds=int(os.environ.get("IBKR_TIMEOUT_SECONDS", "10")),
+        host=os.environ.get("IBKR_HOST", config.host),
+        port=int(os.environ.get("IBKR_PORT", config.port)),
+        client_id=int(os.environ.get("IBKR_CLIENT_ID", config.client_id)),
+        timeout_seconds=int(os.environ.get("IBKR_TIMEOUT_SECONDS", config.timeout_seconds)),
     )
 
 

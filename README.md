@@ -60,10 +60,10 @@ IBKR_ALLOW_LIVE_PORT=false
 IBKR_LIVE_CLIENT_ID=4
 IBKR_LIVE_SYMBOL=APLD
 IBKR_LIVE_TIMEZONE=America/New_York
-IBKR_LIVE_DURATION=3 D
+IBKR_LIVE_DURATION=1 D
 IBKR_LIVE_BAR_SIZE=5 mins
 IBKR_LIVE_WHAT_TO_SHOW=TRADES
-IBKR_LIVE_USE_RTH=1
+IBKR_LIVE_USE_RTH=0
 IBKR_LIVE_MONEY_PER_TRADE=10000
 IBKR_LIVE_MAX_SIGNAL_AGE_MINUTES=7
 IBKR_LIVE_LOOP=false
@@ -200,34 +200,33 @@ The script currently:
 
 ## Strategy Summary
 
-Buy setup:
+Data used:
 
 - Use only regular-session candles.
-- Calculate the recent close-price slope using the previous `buy_regression_bars` candles.
-- Mark a setup when the recent slope is negative.
-- Require the setup candle body to be smaller than `doji_body_range_ratio` times the recent average range.
-- Require the next candle after the setup candle to be green.
+- Use 5-minute candles.
+- `current_gap` compares the current close to the regular-session open.
+- `recent_high` and `recent_low` use previous candles only.
+- `trend_open_now` and `trend_open_r2` measure the move from the open through the current candle.
+- `trend_open_recent_low`, `r2_open_recent_low`, and `decline_open_recent_low_pct` measure the decline from the open to the recent low.
+
+Buy setup:
+
+- Looks at the previous `buy_regression_bars` closes.
+- Requires the previous close-price slope to be negative.
+- Requires the setup candle to be small/doji-like versus the recent average range.
+- Requires the next candle to be green.
 
 Buy execution:
 
-- Execute two candles after the setup candle.
-- Use that execution candle's open as `buy_price`.
-- Only execute if the execution time is before `latest_buy_time`.
+- Executes two candles after the setup candle, at that candle's open.
+- Must execute before `latest_buy_time`.
 
-Profit sell:
+Sell logic:
 
-- Wait until at least `sell_regression_bars` candles have passed after the buy.
-- Calculate the recent close-price slope.
-- Require the slope to still be positive.
-- Require the slope to be weaker than the previous slope by at least `sell_slope_slowdown_pct`.
-- Require the previous candle high to be within `near_high_pct` of the highest price since the buy.
-- Sell at the current candle's open.
-
-Force exit:
-
-- Start checking after `force_exit_start_time`.
-- If a candle low touches or falls below the first buy price, sell at the first buy price.
-- The strategy assumes this fill is valid based on the 5-minute candle range.
+- Profit sell waits for `sell_regression_bars`, then sells when the sell slope is positive, slowing, and near the high since buy.
+- Late sell uses the same slope slowdown idea after `late_sell_start_time`.
+- Force exit starts at `force_exit_start_time`; it exits at the buy price only if the buy price is inside that candle's high-low range.
+- Final exit sells at the `final_exit_time` candle open if no other sell rule has closed the trade.
 
 ## Strategy Parameters
 
@@ -237,16 +236,24 @@ Key parameters are defined in `StrategyConfig` at the top of `intraday.py`:
 symbol = "APLD"
 start = "2025-01-01"
 end = "2026-09-07"
-buy_regression_bars = 7
-body_average_bars = 12
+bar_minutes = 5
+buy_regression_bars = 4
+body_average_bars = 4
 range_quantile = 0.3
 doji_body_range_ratio = 0.15
+latest_buy_time = time(14, 0)
 near_high_pct = 0.002
-sell_regression_bars = 7
+sell_regression_bars = 12
 sell_slope_slowdown_pct = 0
-force_exit_start_time = time(15, 0)
-update_graphs = False
+force_exit_start_time = time(15, 40)
+late_sell_start_time = time(14, 0)
+final_exit_time = time(15, 40)
+update_graphs = True
 clear_existing_graphs = True
+plot_all_dates = False
+plot_summary_dates = True
+plot_filtered_folders = True
+summary_graph_folder = Path("summary trade graph")
 save_trade_log = True
 trade_log_path = Path("trade_log.csv")
 print_period_summary = True
@@ -257,22 +264,33 @@ simulate_real_trading = True
 starting_money = 10000.0
 money_per_trade = 10000.0
 trading_cost = 2.0
+summary_start = date(2026, 5, 1)
+summary_end = date(2026, 5, 30)
+fetch_lookback_days = 10
 ```
 
 Adjust these values to test different signal behavior.
 
 `sell_slope_slowdown_pct` controls how much the upward slope must weaken before selling. For example, `0.20` means the current sell slope must be at least 20% lower than the previous sell slope. A value of `0` sells as soon as the current positive slope is lower than the previous positive slope.
 
-The sell logic has two paths:
+The sell logic has these paths:
 
 - Profit sell: price is near the high since buying and upward momentum has slowed enough.
-- Force exit: after the configured force-exit time, if a candle low touches the first buy price, the trade exits at the buy price.
+- Late sell: same slowdown rule, but allowed after the late-sell time.
+- Force exit: after the configured force-exit time, if the buy price is inside the sell candle range, the trade exits at the buy price.
+- Market-close exit: if force exit never becomes valid, the trade exits on the final regular-market candle before 4:00 PM.
 
 Set `update_graphs = True` when you want to regenerate chart files. Set it to `False` when you only want the strategy stats to run faster.
 
 Keep `clear_existing_graphs = True` if you want graph folders to match the current run. This removes old `APLD_*.png` files from each graph folder before saving the new current set.
 
-Keep `save_trade_log = True` to save one row per executed trade to `trade_log.csv`.
+Use `plot_summary_dates = True` to save charts from `summary_start` through `summary_end` into `summary trade graph`.
+
+Filtered folders such as `negative trade graph` and `non_executed trade graph` are also based on the summary period and copy from `summary trade graph`.
+
+Use `plot_all_dates = True` only when you also want charts for every fetched regular-market date in `trade graph`.
+
+Keep `save_trade_log = True` to save one row per summary-period day to `trade_log.csv`. Days with no executed buy remain in the log with `exit_type = "no_trade"` and `trade_return = 0`.
 
 Run `quote_spread_check.py` after the trade log is created to compare each trade against Alpaca IEX quote data:
 
@@ -301,15 +319,16 @@ The real trading simulation starts from `starting_money` at `summary_start`, the
 The strategy is split into focused steps:
 
 - `fetch_bars()` loads Alpaca data.
-- `add_base_features()` and `add_gap_features()` calculate reusable columns.
+- `add_base_features()`, `add_gap_features()`, and `add_more_features()` calculate reusable columns.
 - `add_buy_signals()` defines the setup, confirmation candle, and execution candle.
 - `add_sell_signals()` defines the exit logic.
 - `add_trade_returns()` calculates returns.
 - `create_trade_log()` converts the candle data into one row per summary-period day.
+- `load_trade_log()` loads the saved trade log back into Python.
 - `add_real_trading_simulation()` adds money used, shares, trading cost, net P/L, and ending money to the trade log.
 - `summarize_performance()` returns performance stats that can be reused in comparisons.
 - `create_period_summary_table()` summarizes the same stats across repeated month-based periods.
-- `plot_trade_day()` and `plot_all_trade_days()` save candlestick charts.
+- `plot_trade_day()`, `plot_all_trade_days()`, and `plot_summary_trade_days()` save candlestick charts.
 - `copy_trade_days_to_folder()` copies already-created chart files into extra folders for negative-return trades and unexecuted setups.
 
 ## Output
@@ -327,7 +346,7 @@ negative trade graph/APLD_YYYY-MM-DD.png
 non_executed trade graph/APLD_YYYY-MM-DD.png
 ```
 
-The unexecuted setup folder includes setup days that did not produce a buy price, plus setup days that bought but did not produce a sell.
+The unexecuted setup folder includes setup days that did not produce a buy.
 
 The trade log is saved as:
 
@@ -335,7 +354,7 @@ The trade log is saved as:
 trade_log.csv
 ```
 
-It includes date, setup time, buy time, buy price, sell time, sell price, return, exit type, max possible return after buy, and daily high after buy.
+It includes date, setup time, buy type, buy time, buy price, sell time, sell price, return, exit type, max possible return after buy, recent high/low features, and gap features.
 
 Each chart marks:
 
