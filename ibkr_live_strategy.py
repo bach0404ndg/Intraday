@@ -404,7 +404,7 @@ def calculate_order_shares(money_per_trade, price):
 
 def latest_buy_action(strategy_data, state, live_config):
     buy_rows = strategy_data[
-        strategy_data["first_buy_signal"]
+        strategy_data["buy_signal"]
         & strategy_data["buy_time"].notna()
         & strategy_data["buy_price"].notna()
     ].copy()
@@ -445,7 +445,7 @@ def latest_sell_action(strategy_data, state, live_config):
         return None
 
     sell_rows = strategy_data[
-        strategy_data["first_sell_signal"]
+        strategy_data["sell_signal"]
         & strategy_data["sell_time"].notna()
         & strategy_data["sell_price"].notna()
     ].copy()
