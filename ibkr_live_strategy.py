@@ -75,6 +75,8 @@ class IBKRLiveStrategyConfig:
     currency: str = "USD"
     money_per_trade: float = 10000.0
     max_signal_age_minutes: int = 7
+    buy_limit_offset: float = 0.01
+    sell_limit_offset: float = 0.01
     loop: bool = False
     check_interval_seconds: int = 300
     stop_after_checks: int = 0
@@ -105,6 +107,8 @@ def load_config():
         max_signal_age_minutes=int(
             os.environ.get("IBKR_LIVE_MAX_SIGNAL_AGE_MINUTES", "7")
         ),
+        buy_limit_offset=float(os.environ.get("IBKR_LIVE_BUY_LIMIT_OFFSET", "0.01")),
+        sell_limit_offset=float(os.environ.get("IBKR_LIVE_SELL_LIMIT_OFFSET", "0.01")),
         loop=env_bool("IBKR_LIVE_LOOP", False),
         check_interval_seconds=int(
             os.environ.get("IBKR_LIVE_CHECK_INTERVAL_SECONDS", "300")
@@ -402,6 +406,36 @@ def calculate_order_shares(money_per_trade, price):
     return int(money_per_trade // price)
 
 
+def latest_price(strategy_data):
+    prices = strategy_data["close"].dropna()
+
+    if prices.empty:
+        return None
+
+    return float(prices.iloc[-1])
+
+
+def buy_limit_price(strategy_data, strategy_buy_price, live_config):
+    current_price = latest_price(strategy_data)
+
+    if current_price is None:
+        return strategy_buy_price
+
+    return current_price + live_config.buy_limit_offset
+
+
+def sell_limit_price(strategy_data, strategy_sell_price, live_config):
+    current_price = latest_price(strategy_data)
+
+    if current_price is None:
+        return strategy_sell_price
+
+    return max(
+        0.01,
+        current_price - live_config.sell_limit_offset,
+    )
+
+
 def latest_buy_action(strategy_data, state, live_config):
     buy_rows = strategy_data[
         strategy_data["buy_signal"]
@@ -425,7 +459,16 @@ def latest_buy_action(strategy_data, state, live_config):
     if not is_fresh_signal(row["buy_time"], live_config):
         return None
 
-    shares = calculate_order_shares(live_config.money_per_trade, row["buy_price"])
+    limit_price = buy_limit_price(
+        strategy_data,
+        row["buy_price"],
+        live_config,
+    )
+
+    shares = calculate_order_shares(
+        live_config.money_per_trade,
+        limit_price,
+    )
 
     if shares <= 0:
         return None
@@ -433,7 +476,7 @@ def latest_buy_action(strategy_data, state, live_config):
     return {
         "action": "BUY",
         "signal_time": row["buy_time"],
-        "price": row["buy_price"],
+        "price": limit_price,
         "shares": shares,
         "signal_id": action_id,
         "reason": "fresh_strategy_buy",
@@ -473,17 +516,23 @@ def latest_sell_action(strategy_data, state, live_config):
 
     if row.get("force_exit", False):
         sell_reason = "force_exit"
-    elif row.get("late_sell_signal", False):
-        sell_reason = "late_sell"
-    elif row.get("final_exit_signal", False):
-        sell_reason = "final_exit"
-    else:
+    elif row.get("stop_loss_signal", False):
+        sell_reason = "stop_loss"
+    elif row.get("early_take_profit_signal", False):
+        sell_reason = "early_take_profit"
+    elif row.get("profit_sell_signal", False):
         sell_reason = "profit_sell"
+    else:
+        sell_reason = "sell_signal"
 
     return {
         "action": "SELL",
         "signal_time": row["sell_time"],
-        "price": row["sell_price"],
+        "price": sell_limit_price(
+            strategy_data,
+            row["sell_price"],
+            live_config,
+        ),
         "shares": shares,
         "signal_id": action_id,
         "reason": sell_reason,
@@ -575,20 +624,23 @@ def update_state_after_order(state, action, order_result, config):
     filled = filled_shares(order_result)
 
     if filled <= 0:
-        state["last_signal_id"] = action["signal_id"]
+        if action["action"] == "BUY":
+            state["last_signal_id"] = action["signal_id"]
+
         return state
 
-    state["last_signal_id"] = action["signal_id"]
-
     if action["action"] == "BUY":
+        state["last_signal_id"] = action["signal_id"]
         state["position"] = "long"
         state["trade_date"] = action["signal_time"].date().isoformat()
         state["buy_time"] = action["signal_time"].isoformat()
         state["buy_price"] = float(action["price"])
         state["shares"] = int(filled)
-    elif action["action"] == "SELL":
+    elif action["action"] == "SELL" and filled >= int(action["shares"]):
         state = empty_state()
         state["last_signal_id"] = action["signal_id"]
+    elif action["action"] == "SELL":
+        state["shares"] = int(action["shares"]) - int(filled)
 
     return state
 

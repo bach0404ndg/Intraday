@@ -32,45 +32,49 @@ pd.set_option("display.width", None)
 @dataclass(frozen=True)
 class StrategyConfig:
     symbol: str = "APLD"
-    start: str = "2026-05-01"
-    end: str = "2026-08-30"
+    start: str = "2026-01-01"
+    end: str = "2026-09-14"
     timezone: str = "America/New_York"
     bar_minutes: int = 5
 
     # Buy
-    buy_regression_bars: int = 7
-    body_average_bars: int = 7
+    buy_regression_bars: int = 6
+    body_average_bars: int = 8
     doji_body_range_ratio: float = 0.1
-    latest_buy_time: time = time(13, 0)
+    latest_buy_time: time = time(13, 15)
 
-    #Avoid Bad day
-    avoid_downstream_buy: bool = True
-    downstream_decline_pct: float = 0.08
-    downstream_trend_r2_min: float = 0.5
-
-    # Buy Winning
-    use_buy_winning: bool = True
-    buy_winning_pct: float = 0.05
-    earliest_buy_winning_time = time(9, 45)
-    latest_buy_winning_time: time = time(10, 30)
+    # Buy Momentum
+    use_buy_momentum: bool = True
+    momentum_buy_regression_bars: int = 4
+    momentum_body_average_bars: int = 5
+    momentum_doji_body_range_ratio: float = 0.08
+    momentum_latest_buy_time: time = time(13, 0)
 
     # Sell
-    near_high_pct: float = 0.001
-    near_high_bars: int = 3
-    sell_regression_bars: int = 12
-    sell_regression_bars_winning: int = 6
-    sell_slope_slowdown_pct: float = 0
+    near_high_pct: float = 0.0
+    near_high_bars: int = 2
+    sell_regression_bars: int = 11
+
+    near_high_pct_momentum: float = 0.001
+    near_high_bars_momentum: int = 4
+    sell_regression_bars_momentum: int = 2
 
     use_early_take_profit: bool = False
     early_take_profit_pct: float = 0.03
+    use_early_take_profit_momentum: bool = False
+    early_take_profit_pct_momentum: float = 0.03
 
     use_stop_loss: bool = True
-    support_bars = 20
-    stop_loss_pct: float = 0.01
+    support_bars: int = 19
+    stop_loss_pct: float = 0.005
     support_break_pct: float = 0.005
-    winning_stop_loss_from_high_pct: float = 0.01
-    stop_loss_bars = 3
-    force_exit_time: time = time(15, 00)
+    stop_loss_bars: int = 3
+    force_exit_time: time = time(15, 30)
+
+    use_stop_loss_momentum: bool = True
+    momentum_stop_loss_from_high_pct: float = 0.0075
+    stop_loss_bars_momentum: int = 1
+    force_exit_time_momentum: time = time(15, 00)
 
     # Trading simulation
     starting_money: float = 10000.0
@@ -78,11 +82,14 @@ class StrategyConfig:
     trading_cost: float = 2.0
 
     # Output
+    plot_graphs: bool = False
     output_folder: Path = Path("trade graph")
     save_negative_graphs: bool = True
     negative_graph_folder: Path = Path("negative trade graph")
     save_non_traded_graphs: bool = True
     non_traded_graph_folder: Path = Path("non traded graph")
+    previous_day_plot_bars: int = 6
+    previous_day_plot_gap_bars: int = 2
     trade_log_path: Path = Path("trade_log.csv")
     clear_old_graphs: bool = True
 
@@ -126,6 +133,34 @@ def stock_contract(config):
     contract.currency = "USD"
 
     return contract
+
+
+def config_end_timestamp(config):
+    end_date = pd.Timestamp(
+        config.end,
+        tz=config.timezone,
+    )
+
+    end_value = str(
+        config.end
+    )
+
+    is_date_only = (
+        len(end_value) == 10
+        and end_date.time() == time(0, 0)
+    )
+
+    if not is_date_only:
+        return end_date
+
+    now = pd.Timestamp.now(
+        tz=config.timezone,
+    )
+
+    if end_date.date() == now.date():
+        return now
+
+    return end_date + pd.Timedelta(days=1)
 
 
 class IBKRHistoricalClient(EWrapper, EClient):
@@ -209,9 +244,8 @@ def fetch_bars(config):
         tz=config.timezone,
     )
 
-    end_date = pd.Timestamp(
-        config.end,
-        tz=config.timezone,
+    end_date = config_end_timestamp(
+        config,
     )
 
     all_bars = []
@@ -537,31 +571,61 @@ def add_gap_features(data, config):
 # ============================================================
 
 def price_slope_pct(values):
+    values = np.asarray(
+        values,
+        dtype=float,
+    )
+
+    if (
+        len(values) < 2
+        or not np.isfinite(values).all()
+        or (values <= 0).any()
+    ):
+        return np.nan
+
     time_index = np.arange(
         len(values)
     )
 
-    slope = np.polyfit(
-        time_index,
-        np.log(values),
-        1,
-    )[0]
+    try:
+        slope = np.polyfit(
+            time_index,
+            np.log(values),
+            1,
+        )[0]
+    except np.linalg.LinAlgError:
+        return np.nan
 
     return np.exp(slope) - 1
 
 
 def price_r2(values):
+    values = np.asarray(
+        values,
+        dtype=float,
+    )
+
+    if (
+        len(values) < 2
+        or not np.isfinite(values).all()
+        or (values <= 0).any()
+    ):
+        return np.nan
+
     time_index = np.arange(
         len(values)
     )
 
     log_values = np.log(values)
 
-    slope, intercept = np.polyfit(
-        time_index,
-        log_values,
-        1,
-    )
+    try:
+        slope, intercept = np.polyfit(
+            time_index,
+            log_values,
+            1,
+        )
+    except np.linalg.LinAlgError:
+        return np.nan
 
     fitted = (
         slope * time_index
@@ -595,6 +659,43 @@ def rolling_slope_pct_by_day(
             .rolling(bars)
             .apply(
                 price_slope_pct,
+                raw=True,
+            )
+        )
+    )
+
+
+def rolling_current_slope_pct_by_day(
+    data,
+    column,
+    bars,
+):
+    return (
+        data.groupby("date")[column]
+        .transform(
+            lambda x:
+            x.rolling(bars)
+            .apply(
+                price_slope_pct,
+                raw=True,
+            )
+        )
+    )
+
+
+def rolling_r2_by_day(
+    data,
+    column,
+    bars,
+):
+    return (
+        data.groupby("date")[column]
+        .transform(
+            lambda x:
+            x.shift(1)
+            .rolling(bars)
+            .apply(
+                price_r2,
                 raw=True,
             )
         )
@@ -678,31 +779,61 @@ def add_buy_signals(data, config):
         )
     )
 
-    data["downstream_no_buy"] = (
-        config.avoid_downstream_buy
-        & (
-            data["downstream_decline"]
-            >= config.downstream_decline_pct
+    data["momentum_avg_range_pct"] = (
+        data.groupby("date")["range_pct"]
+        .transform(
+            lambda x:
+            x.shift(1)
+            .rolling(
+                config.momentum_body_average_bars
+            )
+            .mean()
         )
-        & (
-            data["downstream_trend_slope"]
-            < 0
-        )
-        & (
-            data["downstream_trend_r2"]
-            >= config.downstream_trend_r2_min
+    )
+
+    data["momentum_doji_body"] = (
+        data["body_pct"]
+        < config.momentum_doji_body_range_ratio
+        * data["momentum_avg_range_pct"]
+    )
+
+    data["momentum_slope"] = (
+        rolling_slope_pct_by_day(
+            data,
+            column="close",
+            bars=config.momentum_buy_regression_bars,
         )
     )
 
     by_day = data.groupby("date")
+
+    data["previous_momentum_slope"] = (
+        by_day["momentum_slope"]
+        .shift(1)
+    )
+
+    data["momentum_slope_change"] = (
+        data["momentum_slope"]
+        - data["previous_momentum_slope"]
+    )
+
+    data["momentum_slope_down"] = (
+        data["momentum_slope"]
+        < data["previous_momentum_slope"]
+    )
 
     data["confirmation_candle_color"] = (
         by_day["candle_color"]
         .shift(-1)
     )
 
+    data["green_confirmation"] = (
+        data["confirmation_candle_color"]
+        == "green"
+    )
+
     # ============================================================
-    # NORMAL BUY EXECUTION: 2 BARS LATER
+    # NORMAL BUY EXECUTION: AFTER GREEN CONFIRMATION
     # ============================================================
 
     data["execution_time"] = (
@@ -723,17 +854,17 @@ def add_buy_signals(data, config):
     )
 
     # ============================================================
-    # WINNING BUY EXECUTION: NEXT OPEN
+    # MOMENTUM BUY EXECUTION: AFTER GREEN CONFIRMATION
     # ============================================================
 
-    data["winning_execution_time"] = (
+    data["momentum_execution_time"] = (
         by_day["timestamp"]
-        .shift(-1)
+        .shift(-2)
     )
 
-    data["winning_execution_price"] = (
+    data["momentum_execution_price"] = (
         by_day["open"]
-        .shift(-1)
+        .shift(-2)
     )
 
     # ============================================================
@@ -743,34 +874,36 @@ def add_buy_signals(data, config):
     data["setup_signal"] = (
             (data["slope"] < 0)
             & data["doji_body"]
-            & (data["confirmation_candle_color"] == "green")
+            & data["green_confirmation"]
     )
 
     candidate_buy = (
             data["setup_signal"]
             & data["execution_price"].notna()
             & data["before_latest_buy_time"]
-            & ~data["downstream_no_buy"]
     )
 
     # ============================================================
-    # WINNING BUY
+    # MOMENTUM BUY
     # ============================================================
-    if config.use_buy_winning:
-        candidate_buy_winning = (
-                (data["current_gap"] > config.buy_winning_pct)
-                & data["winning_execution_price"].notna()
-                & clock_time_after(
-                data["winning_execution_time"],
-                config.earliest_buy_winning_time)
+    if config.use_buy_momentum:
+        momentum_time_window = (
+                data["momentum_execution_price"].notna()
                 & clock_time_before(
-            data["winning_execution_time"],
-            config.latest_buy_winning_time
+                    data["momentum_execution_time"],
+                    config.momentum_latest_buy_time,
+                )
         )
-                & ~data["downstream_no_buy"]
+
+        candidate_buy_momentum = (
+                momentum_time_window
+                & (data["momentum_slope"] > 0)
+                & data["momentum_slope_down"]
+                & data["momentum_doji_body"]
+                & data["green_confirmation"]
         )
     else:
-        candidate_buy_winning = pd.Series(
+        candidate_buy_momentum = pd.Series(
             False,
             index=data.index,
         )
@@ -781,7 +914,7 @@ def add_buy_signals(data, config):
 
     candidate_buy_any = (
             candidate_buy
-            | candidate_buy_winning
+            | candidate_buy_momentum
     )
 
     data["buy_signal"] = (
@@ -794,33 +927,32 @@ def add_buy_signals(data, config):
             )
     )
 
-    data["buy_winning_signal"] = (
+    data["buy_momentum_signal"] = (
             data["buy_signal"]
-            & candidate_buy_winning
+            & candidate_buy_momentum
     )
 
     data["buy_normal_signal"] = (
             data["buy_signal"]
             & candidate_buy
-            & ~data["buy_winning_signal"]
+            & ~data["buy_momentum_signal"]
     )
 
     # ============================================================
     # BUY TYPE
-    # winning gets priority if both conditions happen
-    # on the same row
+    # Same-row priority: momentum, then catch bottom.
     # ============================================================
 
     data["buy_type"] = np.select(
         [
             data["buy_signal"]
-            & candidate_buy_winning,
+            & candidate_buy_momentum,
 
             data["buy_signal"]
             & candidate_buy,
         ],
         [
-            "winning",
+            "momentum",
             "normal",
         ],
         default=None,
@@ -831,18 +963,24 @@ def add_buy_signals(data, config):
     # ============================================================
 
     data["buy_time"] = (
-        data["winning_execution_time"]
+        data["momentum_execution_time"]
         .where(
-            data["buy_type"] == "winning",
+            data["buy_type"].str.startswith(
+                "momentum",
+                na=False,
+            ),
             data["execution_time"],
         )
         .where(data["buy_signal"])
     )
 
     data["buy_price"] = (
-        data["winning_execution_price"]
+        data["momentum_execution_price"]
         .where(
-            data["buy_type"] == "winning",
+            data["buy_type"].str.startswith(
+                "momentum",
+                na=False,
+            ),
             data["execution_price"],
         )
         .where(data["buy_signal"])
@@ -938,12 +1076,16 @@ def add_sell_signals(data, config):
     clock_time = clock_times(
         data["timestamp"]
     )
+    is_momentum_trade = data["buy_type"].str.startswith(
+        "momentum",
+        na=False,
+    )
 
     # ============================================================
     # NORMAL SELL FEATURES
     # ============================================================
 
-    data["recent_previous_high"] = (
+    recent_previous_high_normal = (
         data.groupby("date")["previous_high"]
         .transform(
             lambda x:
@@ -955,10 +1097,41 @@ def add_sell_signals(data, config):
         )
     )
 
+    recent_previous_high_momentum = (
+        data.groupby("date")["previous_high"]
+        .transform(
+            lambda x:
+            x.rolling(
+                config.near_high_bars_momentum,
+                min_periods=1,
+            )
+            .max()
+        )
+    )
+
+    data["recent_previous_high"] = (
+        recent_previous_high_momentum
+        .where(
+            is_momentum_trade,
+            recent_previous_high_normal,
+        )
+    )
+
+    data["active_near_high_pct"] = (
+        pd.Series(
+            config.near_high_pct,
+            index=data.index,
+        )
+        .where(
+            ~is_momentum_trade,
+            config.near_high_pct_momentum,
+        )
+    )
+
     data["near_high"] = (
         data["recent_previous_high"]
         >= data["previous_high_since_buy"]
-        * (1 - config.near_high_pct)
+        * (1 - data["active_near_high_pct"])
     )
 
     data["slope_sell_normal"] = (
@@ -969,18 +1142,21 @@ def add_sell_signals(data, config):
         )
     )
 
-    data["slope_sell_winning"] = (
+    data["slope_sell_momentum"] = (
         rolling_slope_pct_by_day(
             data,
             column="close",
-            bars=config.sell_regression_bars_winning,
+            bars=config.sell_regression_bars_momentum,
         )
     )
 
     data["slope_sell"] = (
-        data["slope_sell_winning"]
+        data["slope_sell_momentum"]
         .where(
-            data["buy_type"] == "winning",
+            data["buy_type"].str.startswith(
+                "momentum",
+                na=False,
+            ),
             data["slope_sell_normal"],
         )
     )
@@ -993,7 +1169,6 @@ def add_sell_signals(data, config):
     data["slope_slowing_enough"] = (
         data["slope_sell"]
         < data["previous_slope_sell"]
-        * (1 - config.sell_slope_slowdown_pct)
     )
 
     normal_regression_ready_time = (
@@ -1006,20 +1181,23 @@ def add_sell_signals(data, config):
         )
     )
 
-    winning_regression_ready_time = (
+    momentum_regression_ready_time = (
         data["buy_time"]
         + pd.Timedelta(
             minutes=(
                 config.bar_minutes
-                * config.sell_regression_bars_winning
+                * config.sell_regression_bars_momentum
             )
         )
     )
 
     regression_ready_time = (
-        winning_regression_ready_time
+        momentum_regression_ready_time
         .where(
-            data["buy_type"] == "winning",
+            data["buy_type"].str.startswith(
+                "momentum",
+                na=False,
+            ),
             normal_regression_ready_time,
         )
     )
@@ -1033,34 +1211,50 @@ def add_sell_signals(data, config):
     # EARLY TAKE-PROFIT LIMIT ORDER
     # ============================================================
 
-    early_take_profit_price = (
-        data["buy_price"]
-        * (1 + config.early_take_profit_pct)
-    )
-
-    if config.use_early_take_profit:
-        early_take_profit_candidate = (
-            data["buy_time"].notna()
-            & (data["timestamp"] > data["buy_time"])
-            & (data["low"] <= early_take_profit_price)
-            & (data["high"] >= early_take_profit_price)
-        )
-
-        data["early_take_profit_signal"] = (
-            early_take_profit_candidate
-            & (
-                early_take_profit_candidate
-                .groupby(data["date"])
-                .cumsum()
-                == 1
-            )
-        )
-
-    else:
-        data["early_take_profit_signal"] = pd.Series(
-            False,
+    active_early_take_profit_pct = (
+        pd.Series(
+            config.early_take_profit_pct,
             index=data.index,
         )
+        .where(
+            ~is_momentum_trade,
+            config.early_take_profit_pct_momentum,
+        )
+    )
+
+    active_use_early_take_profit = (
+        pd.Series(
+            config.use_early_take_profit,
+            index=data.index,
+        )
+        .where(
+            ~is_momentum_trade,
+            config.use_early_take_profit_momentum,
+        )
+    )
+
+    early_take_profit_price = (
+        data["buy_price"]
+        * (1 + active_early_take_profit_pct)
+    )
+
+    early_take_profit_candidate = (
+        active_use_early_take_profit
+        & data["buy_time"].notna()
+        & (data["timestamp"] > data["buy_time"])
+        & (data["low"] <= early_take_profit_price)
+        & (data["high"] >= early_take_profit_price)
+    )
+
+    data["early_take_profit_signal"] = (
+        early_take_profit_candidate
+        & (
+            early_take_profit_candidate
+            .groupby(data["date"])
+            .cumsum()
+            == 1
+        )
+    )
 
     early_already_sold = (
         data["early_take_profit_signal"]
@@ -1090,65 +1284,87 @@ def add_sell_signals(data, config):
         * (1 - config.support_break_pct)
     )
 
-    winning_stop_loss_price = (
+    momentum_stop_loss_price = (
         data["previous_open_at_high_since_buy"]
-        * (1 - config.winning_stop_loss_from_high_pct)
+        * (1 - config.momentum_stop_loss_from_high_pct)
     )
 
     data["active_stop_loss_price"] = (
-        winning_stop_loss_price
+        momentum_stop_loss_price
         .where(
-            data["buy_type"] == "winning",
+            is_momentum_trade,
             stop_loss_price,
         )
     )
 
-    if config.use_stop_loss:
-        stop_loss_ready = (
-                data["buy_time"].notna()
-                & (data["timestamp"] > data["buy_time"]
-                   + pd.Timedelta(
-                    minutes=config.bar_minutes * config.stop_loss_bars))
-                & ~early_already_sold
-        )
-
-        normal_stop_loss_candidate = (
-                stop_loss_ready
-                & (data["buy_type"] != "winning")
-                & (data["low"] <= stop_loss_price)
-                & (
-                    data["support_level"].isna()
-                    | (data["low"] <= support_break_price)
-                )
-        )
-
-        winning_stop_loss_candidate = (
-                stop_loss_ready
-                & (data["buy_type"] == "winning")
-                & data["previous_open_at_high_since_buy"].notna()
-                & (data["low"] <= winning_stop_loss_price)
-        )
-
-        stop_loss_candidate = (
-            normal_stop_loss_candidate
-            | winning_stop_loss_candidate
-        )
-
-        data["stop_loss_signal"] = (
-            stop_loss_candidate
-            & (
-                stop_loss_candidate
-                .groupby(data["date"])
-                .cumsum()
-                == 1
-            )
-        )
-
-    else:
-        data["stop_loss_signal"] = pd.Series(
-            False,
+    data["active_stop_loss_bars"] = (
+        pd.Series(
+            config.stop_loss_bars,
             index=data.index,
         )
+        .where(
+            ~is_momentum_trade,
+            config.stop_loss_bars_momentum,
+        )
+    )
+
+    active_use_stop_loss = (
+        pd.Series(
+            config.use_stop_loss,
+            index=data.index,
+        )
+        .where(
+            ~is_momentum_trade,
+            config.use_stop_loss_momentum,
+        )
+    )
+
+    stop_loss_ready_time = (
+        data["buy_time"]
+        + pd.to_timedelta(
+            data["active_stop_loss_bars"] * config.bar_minutes,
+            unit="m",
+        )
+    )
+
+    stop_loss_ready = (
+        active_use_stop_loss
+        & data["buy_time"].notna()
+        & (data["timestamp"] > stop_loss_ready_time)
+        & ~early_already_sold
+    )
+
+    normal_stop_loss_candidate = (
+        stop_loss_ready
+        & ~is_momentum_trade
+        & (data["low"] <= stop_loss_price)
+        & (
+            data["support_level"].isna()
+            | (data["low"] <= support_break_price)
+        )
+    )
+
+    momentum_stop_loss_candidate = (
+        stop_loss_ready
+        & is_momentum_trade
+        & data["previous_open_at_high_since_buy"].notna()
+        & (data["low"] <= momentum_stop_loss_price)
+    )
+
+    stop_loss_candidate = (
+        normal_stop_loss_candidate
+        | momentum_stop_loss_candidate
+    )
+
+    data["stop_loss_signal"] = (
+        stop_loss_candidate
+        & (
+            stop_loss_candidate
+            .groupby(data["date"])
+            .cumsum()
+            == 1
+        )
+    )
 
     stop_already_sold = (
         data["stop_loss_signal"]
@@ -1199,9 +1415,20 @@ def add_sell_signals(data, config):
     # TIME FORCE EXIT
     # ============================================================
 
+    force_exit_time_signal = (
+        pd.Series(
+            clock_time == config.force_exit_time,
+            index=data.index,
+        )
+        .where(
+            ~is_momentum_trade,
+            clock_time == config.force_exit_time_momentum,
+        )
+    )
+
     data["force_exit"] = (
         data["buy_time"].notna()
-        & (clock_time == config.force_exit_time)
+        & force_exit_time_signal
         & ~already_sold
     )
 
@@ -1317,14 +1544,14 @@ def run_strategy_on_data(data, config):
         config,
     )
 
-    data = get_session_data(
-        data,
-        "regular",
-    )
-
     data = add_gap_features(
         data,
         config,
+    )
+
+    data = get_session_data(
+        data,
+        "regular",
     )
 
     data = add_buy_signals(
@@ -1463,6 +1690,11 @@ def create_trade_log(
                 / buy_row["buy_price"]
             )
 
+        if str(buy_row["buy_type"]).startswith("momentum"):
+            buy_slope = buy_row["momentum_slope"]
+        else:
+            buy_slope = buy_row["slope"]
+
         trade_rows.append({
             "date": trading_date,
 
@@ -1480,7 +1712,7 @@ def create_trade_log(
             "pct_decrease_list": pct_decrease_list,
 
             # Buy/setup features
-            "buy_slope": buy_row["slope"],
+            "buy_slope": buy_slope,
             "body_pct": buy_row["body_pct"],
             "range_pct": buy_row["range_pct"],
             "opening_gap": buy_row["opening_gap"],
@@ -1491,7 +1723,12 @@ def create_trade_log(
             "downstream_decline": buy_row["downstream_decline"],
             "downstream_trend_slope": buy_row["downstream_trend_slope"],
             "downstream_trend_r2": buy_row["downstream_trend_r2"],
-            "downstream_no_buy": buy_row["downstream_no_buy"],
+            "momentum_slope": buy_row["momentum_slope"],
+            "previous_momentum_slope": buy_row["previous_momentum_slope"],
+            "momentum_slope_change": buy_row["momentum_slope_change"],
+            "momentum_slope_down": buy_row["momentum_slope_down"],
+            "momentum_avg_range_pct": buy_row["momentum_avg_range_pct"],
+            "momentum_doji_body": buy_row["momentum_doji_body"],
             "support_level": buy_row["support_level"],
             "active_stop_loss_price": active_stop_loss_price,
 
@@ -1755,16 +1992,16 @@ def summarize_trading(
         "win_days": win_days,
 
         "win_day_rate": (
-            win_days / total_days
-            if total_days > 0
+            win_days / completed_count
+            if completed_count > 0
             else 0.0
         ),
 
         "negative_days": negative_days,
 
         "negative_day_rate": (
-            negative_days / total_days
-            if total_days > 0
+            negative_days / completed_count
+            if completed_count > 0
             else 0.0
         ),
 
@@ -1773,6 +2010,48 @@ def summarize_trading(
 
         "total_trading_cost": total_trading_cost,
     }
+
+
+def summarize_by_buy_type(trade_log):
+    completed_trades = trade_log[
+        trade_log["trade_return_pct"].notna()
+    ].copy()
+
+    if completed_trades.empty:
+        return pd.DataFrame()
+
+    rows = []
+
+    for buy_type, group in completed_trades.groupby("buy_type"):
+        rows.append({
+            "buy_type": buy_type,
+            "trades": len(group),
+            "win_rate": (
+                group["trade_return_pct"] > 0
+            ).mean(),
+            "median_return": (
+                group["trade_return_pct"]
+                .median()
+            ),
+            "average_return": (
+                group["trade_return_pct"]
+                .mean()
+            ),
+            "best_return": (
+                group["trade_return_pct"]
+                .max()
+            ),
+            "worst_return": (
+                group["trade_return_pct"]
+                .min()
+            ),
+            "net_pnl": (
+                group["net_pnl"]
+                .sum()
+            ),
+        })
+
+    return pd.DataFrame(rows)
 
 
 def print_trading_summary(summary):
@@ -1813,14 +2092,14 @@ def print_trading_summary(summary):
     print(
         f"Win days:            "
         f"{summary['win_days']} / "
-        f"{summary['total_days']} "
+        f"{summary['completed_trades']} "
         f"({summary['win_day_rate']:.2%})"
     )
 
     print(
         f"Negative days:       "
         f"{summary['negative_days']} / "
-        f"{summary['total_days']} "
+        f"{summary['completed_trades']} "
         f"({summary['negative_day_rate']:.2%})"
     )
 
@@ -1837,6 +2116,50 @@ def print_trading_summary(summary):
     print(
         f"Trading costs:       "
         f"${summary['total_trading_cost']:,.2f}"
+    )
+
+
+def print_buy_type_summary(buy_type_summary):
+    if buy_type_summary.empty:
+        return
+
+    display_table = buy_type_summary.copy()
+
+    rename_buy_type = {
+        "normal": "catch_bottom",
+        "momentum": "momentum",
+    }
+
+    display_table["buy_type"] = (
+        display_table["buy_type"]
+        .map(rename_buy_type)
+        .fillna(display_table["buy_type"])
+    )
+
+    percent_columns = [
+        "win_rate",
+        "median_return",
+        "average_return",
+        "best_return",
+        "worst_return",
+    ]
+
+    for column in percent_columns:
+        display_table[column] = (
+            display_table[column]
+            * 100
+        ).round(3)
+
+    display_table["net_pnl"] = (
+        display_table["net_pnl"]
+        .round(2)
+    )
+
+    print("\nBuy type summary:")
+    print(
+        display_table.to_string(
+            index=False,
+        )
     )
 
 
@@ -1858,6 +2181,176 @@ def save_trade_log(
 # PLOT TRADE DAY
 # ============================================================
 
+def plot_data_with_previous_day(data, selected_date, config):
+    current_day = data[
+        data["date"].astype(str)
+        == str(selected_date)
+    ].copy()
+
+    if current_day.empty:
+        return current_day
+
+    earlier_dates = sorted(
+        data.loc[
+            data["date"].astype(str) < str(selected_date),
+            "date",
+        ].dropna().unique()
+    )
+
+    previous_tail = pd.DataFrame()
+
+    if earlier_dates and config.previous_day_plot_bars > 0:
+        previous_date = earlier_dates[-1]
+        previous_tail = (
+            data[
+                data["date"] == previous_date
+            ]
+            .tail(config.previous_day_plot_bars)
+            .copy()
+        )
+
+    if previous_tail.empty:
+        current_day["plot_x"] = np.arange(
+            len(current_day)
+        )
+        return current_day
+
+    previous_tail["plot_x"] = np.arange(
+        len(previous_tail)
+    )
+
+    current_day["plot_x"] = (
+        np.arange(len(current_day))
+        + len(previous_tail)
+        + config.previous_day_plot_gap_bars
+    )
+
+    return pd.concat(
+        [
+            previous_tail,
+            current_day,
+        ],
+        ignore_index=True,
+    )
+
+
+def set_plot_time_axis(ax, plot_data, selected_date):
+    tick_rows = []
+
+    previous_rows = plot_data[
+        plot_data["date"].astype(str)
+        != str(selected_date)
+    ]
+
+    if not previous_rows.empty:
+        tick_rows.extend(
+            previous_rows.to_dict("records")
+        )
+
+    current_rows = plot_data[
+        plot_data["date"].astype(str)
+        == str(selected_date)
+    ]
+
+    tick_rows.extend(
+        current_rows[
+            current_rows["timestamp"].dt.minute.isin(
+                [
+                    0,
+                    30,
+                ]
+            )
+        ].to_dict("records")
+    )
+
+    if not tick_rows:
+        return
+
+    ax.set_xticks(
+        [
+            row["plot_x"]
+            for row in tick_rows
+        ]
+    )
+
+    ax.set_xticklabels(
+        [
+            (
+                f"{row['timestamp'].strftime('%m-%d')}\n"
+                f"{row['timestamp'].strftime('%H:%M')}"
+                if str(row["date"]) != str(selected_date)
+                else row["timestamp"].strftime("%H:%M")
+            )
+            for row in tick_rows
+        ],
+        rotation=45,
+        ha="right",
+    )
+
+
+def plot_previous_day_separator(ax, plot_data, selected_date):
+    previous_rows = plot_data[
+        plot_data["date"].astype(str)
+        != str(selected_date)
+    ]
+
+    current_rows = plot_data[
+        plot_data["date"].astype(str)
+        == str(selected_date)
+    ]
+
+    if previous_rows.empty or current_rows.empty:
+        return
+
+    separator_x = (
+        previous_rows["plot_x"].max()
+        + current_rows["plot_x"].min()
+    ) / 2
+
+    ax.axvline(
+        separator_x,
+        color="lightgray",
+        linestyle=":",
+        linewidth=1,
+    )
+
+
+def plot_previous_close_line(ax, day_data):
+    previous_close = (
+        day_data["prev_close"]
+        .dropna()
+    )
+
+    if previous_close.empty:
+        return
+
+    previous_close_price = previous_close.iloc[0]
+    last_x = day_data["plot_x"].max()
+
+    ax.axhline(
+        previous_close_price,
+        color="gray",
+        linestyle="--",
+        linewidth=1,
+        alpha=0.7,
+        zorder=0,
+    )
+
+    ax.annotate(
+        f"Prev close ${previous_close_price:.2f}",
+        (
+            last_x,
+            previous_close_price,
+        ),
+        xytext=(8, 0),
+        textcoords="offset points",
+        ha="left",
+        va="center",
+        color="gray",
+        fontsize=9,
+    )
+
+
 def plot_trade_day(
     data,
     selected_date,
@@ -1865,13 +2358,18 @@ def plot_trade_day(
     output_folder=None,
     show=True,
 ):
-    import matplotlib.dates as mdates
     import matplotlib.pyplot as plt
 
     from matplotlib.patches import Rectangle
 
-    day_data = data[
-        data["date"].astype(str)
+    plot_data = plot_data_with_previous_day(
+        data,
+        selected_date,
+        config,
+    )
+
+    day_data = plot_data[
+        plot_data["date"].astype(str)
         == str(selected_date)
     ].copy()
 
@@ -1896,11 +2394,8 @@ def plot_trade_day(
     )
 
     # Candles
-    for _, row in day_data.iterrows():
-
-        x = mdates.date2num(
-            row["timestamp"]
-        )
+    for _, row in plot_data.iterrows():
+        x = row["plot_x"]
 
         color = row["candle_color"]
 
@@ -1927,15 +2422,26 @@ def plot_trade_day(
         ax.add_patch(
             Rectangle(
                 (
-                    x - 0.0012,
+                    x - 0.3,
                     body_bottom,
                 ),
-                0.0024,
+                0.6,
                 body_height,
                 facecolor=color,
                 edgecolor=color,
             )
         )
+
+    plot_previous_close_line(
+        ax,
+        day_data,
+    )
+
+    plot_previous_day_separator(
+        ax,
+        plot_data,
+        selected_date,
+    )
 
     # Buy
     for _, row in day_data[
@@ -1945,8 +2451,8 @@ def plot_trade_day(
         buy_time = row["buy_time"]
         buy_price = row["buy_price"]
 
-        if row["buy_type"] == "winning":
-            buy_color = "purple"
+        if row["buy_type"] == "momentum":
+            buy_color = "blue"
         else:
             buy_color = "black"
 
@@ -1959,8 +2465,17 @@ def plot_trade_day(
             .iloc[0]
         )
 
+        buy_x = (
+            day_data.loc[
+                day_data["timestamp"]
+                == buy_time,
+                "plot_x",
+            ]
+            .iloc[0]
+        )
+
         ax.scatter(
-            buy_time,
+            buy_x,
             buy_candle_low - 0.05,
             marker="^",
             s=150,
@@ -1974,7 +2489,7 @@ def plot_trade_day(
                 f"${buy_price:.2f}"
             ),
             (
-                buy_time,
+                buy_x,
                 buy_candle_low - 0.05,
             ),
             xytext=(0, -10),
@@ -2005,8 +2520,17 @@ def plot_trade_day(
                 .iloc[0]
             )
 
+            high_after_buy_x = (
+                day_data.loc[
+                    day_data["timestamp"]
+                    == high_after_buy_time,
+                    "plot_x",
+                ]
+                .iloc[0]
+            )
+
             ax.scatter(
-                high_after_buy_time,
+                high_after_buy_x,
                 high_after_buy_price + 0.05,
                 marker="v",
                 s=150,
@@ -2020,7 +2544,7 @@ def plot_trade_day(
                     f"${high_after_buy_price:.2f}"
                 ),
                 (
-                    high_after_buy_time,
+                    high_after_buy_x,
                     high_after_buy_price + 0.05,
                 ),
                 xytext=(0, 10),
@@ -2055,8 +2579,17 @@ def plot_trade_day(
             .iloc[0]
         )
 
+        sell_x = (
+            day_data.loc[
+                day_data["timestamp"]
+                == sell_time,
+                "plot_x",
+            ]
+            .iloc[0]
+        )
+
         ax.scatter(
-            sell_time,
+            sell_x,
             sell_candle_high + 0.05,
             marker="v",
             s=150,
@@ -2070,7 +2603,7 @@ def plot_trade_day(
                 f"${sell_price:.2f}"
             ),
             (
-                sell_time,
+                sell_x,
                 sell_candle_high + 0.05,
             ),
             xytext=(0, 10),
@@ -2079,22 +2612,10 @@ def plot_trade_day(
             va="bottom",
         )
 
-    ax.xaxis.set_major_formatter(
-        mdates.DateFormatter(
-            "%H:%M",
-            tz=config.timezone,
-        )
-    )
-
-    ax.xaxis.set_major_locator(
-        mdates.MinuteLocator(
-            byminute=[0, 30],
-            tz=config.timezone,
-        )
-    )
-
-    plt.xticks(
-        rotation=45
+    set_plot_time_axis(
+        ax,
+        plot_data,
+        selected_date,
     )
 
     ax.set_title(
@@ -2128,11 +2649,10 @@ def plot_trade_day(
 
 def plot_all_trade_days(data, config, show=False):
 
-    if config.clear_old_graphs and config.output_folder.exists():
-        for graph_path in config.output_folder.glob(
-                f"{config.symbol}_*.png"
-        ):
-            graph_path.unlink()
+    if config.clear_old_graphs:
+        clear_graph_files(
+            config.output_folder,
+        )
 
     if config.save_non_traded_graphs:
         trade_dates = (
@@ -2154,14 +2674,13 @@ def plot_all_trade_days(data, config, show=False):
         )
 
 
-def clear_graph_files(folder, config):
+def clear_graph_files(folder):
     if not folder.exists():
         return
 
-    for graph_path in folder.glob(
-            f"{config.symbol}_*.png"
-    ):
-        graph_path.unlink()
+    for graph_path in folder.iterdir():
+        if graph_path.is_file():
+            graph_path.unlink()
 
 
 def copy_trade_graphs_to_folder(dates, output_folder, config):
@@ -2173,7 +2692,6 @@ def copy_trade_graphs_to_folder(dates, output_folder, config):
     if config.clear_old_graphs:
         clear_graph_files(
             output_folder,
-            config,
         )
 
     for trade_date in dates:
@@ -2273,26 +2791,32 @@ if __name__ == "__main__":
         config,
     )
 
+    buy_type_summary = summarize_by_buy_type(
+        trade_log
+    )
+
     save_trade_log(
         trade_log,
         config,
     )
 
-    plot_all_trade_days(
-        data,
-        config,
-        show=False,
-    )
+    if config.plot_graphs:
+        plot_all_trade_days(
+            data,
+            config,
+            show=False,
+        )
 
-    save_negative_trade_graphs(
-        trade_log,
-        config,
-    )
+        save_negative_trade_graphs(
+            trade_log,
+            config,
+        )
 
-    save_non_traded_graphs(
-        data,
-        config,
-    )
+        save_non_traded_graphs(
+            data,
+            config,
+        )
 
     print(trade_log)
     print_trading_summary(summary)
+    print_buy_type_summary(buy_type_summary)
